@@ -61,8 +61,19 @@ fn main() {
       gfx: Rc::new(gfx),
       game_ui: None,
       game: Game::new(),
+      input: InputState {
+        ctrl: false,
+        shift: false,
+        alt: false,
+      },
     })
     .unwrap();
+}
+
+struct InputState {
+  ctrl: bool,
+  shift: bool,
+  alt: bool,
 }
 
 struct App {
@@ -70,6 +81,7 @@ struct App {
   gfx: Rc<Graphics>,
   game_ui: Option<ui::GameUi>,
   game: Game,
+  input: InputState,
 }
 
 impl winit::application::ApplicationHandler for App {
@@ -98,19 +110,38 @@ impl winit::application::ApplicationHandler for App {
         is_synthetic: false,
         ..
       } => {
+        if let winit::keyboard::Key::Named(named) = &event.logical_key {
+          match named {
+            winit::keyboard::NamedKey::Control => {
+              self.input.ctrl = event.state.is_pressed();
+            }
+            winit::keyboard::NamedKey::Shift => {
+              self.input.shift = event.state.is_pressed();
+            }
+            winit::keyboard::NamedKey::Alt => {
+              self.input.alt = event.state.is_pressed();
+            }
+            // Backspace handled here to allow key repeat:
+            winit::keyboard::NamedKey::Backspace if event.state.is_pressed() => {
+              self.game.pop_letter();
+            }
+            _ => {}
+          }
+        }
+
         if event.repeat || event.state == winit::event::ElementState::Released {
           return;
         }
 
         if event.logical_key == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter) {
           let _ = self.game.try_commit_guess(); // TODO: Handle commit error
-        } else if event.logical_key
-          == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Backspace)
+        } else if self.input.ctrl
+          && event.logical_key
+            == winit::keyboard::Key::Character(winit::keyboard::SmolStr::new("r"))
         {
-          self.game.pop_letter();
-        } else {
-          // TODO: Only push if ctrl or alt is not pushed down
-          // TODO: Support Ctrl-R reset shortcut
+          // Ctrl-R pressed, restart game.
+          self.game.reset_random(WordSet::Duotrigordle);
+        } else if !self.input.ctrl && !self.input.alt {
           if let Some(text) = event.text {
             for char in text.chars() {
               if let Ok(letter) = Letter::try_from(char) {
@@ -925,9 +956,9 @@ impl Game {
   fn push_letter(&mut self, letter: Letter) -> bool {
     for guess in self.guesses.iter_mut() {
       if *guess.committed.get() {
-        continue
+        continue;
       }
-      return guess.push(letter)
+      return guess.push(letter);
     }
     false
   }
