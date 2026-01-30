@@ -619,6 +619,11 @@ impl GuessMatrix {
       Y: 0.0,
       Z: 0.0,
     })?;
+    visual.SetOffset(Vector3 {
+      X: 0.0,
+      Y: 8.0,
+      Z: 0.0,
+    })?;
 
     Ok(Self { visual, rows })
   }
@@ -927,6 +932,11 @@ impl Keyboard {
     this.visual.SetRelativeOffsetAdjustment(Vector3 {
       X: 0.5,
       Y: 1.0,
+      Z: 0.0,
+    })?;
+    this.visual.SetOffset(Vector3 {
+      X: 0.0,
+      Y: -8.0,
       Z: 0.0,
     })?;
 
