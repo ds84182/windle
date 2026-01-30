@@ -386,6 +386,8 @@ impl LetterTile {
     color_animation.SetDelayTime(time_span(Duration::from_millis(index as u64 * 100)))?;
     color_animation.SetDuration(time_span(Duration::from_millis(250)))?;
 
+    // TODO: Spring animation when entire guess is correct. Tiles jump upward and spring downward.
+
     let this = Rc::new(LetterTile {
       cx: cx.clone(),
       visual,

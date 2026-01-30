@@ -578,12 +578,10 @@ impl WordDB {
       list.push(word);
       index_map.insert(word, index);
       if nyt_words.peek() == Some(&word) {
-        // nyt_word_set.insert(index as u32);
         nyt_word_set.push(index as u32);
         nyt_words.next();
       }
       if duotrigordle_words.peek() == Some(&word) {
-        // duotrigordle_word_set.insert(index as u32);
         duotrigordle_word_set.push(index as u32);
         duotrigordle_words.next();
       }
@@ -641,18 +639,21 @@ enum LetterStatus {
   Absent,
 }
 
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum GuessStatus {
+  Guessing,
+  Guessed { correct: bool },
+}
+
 struct GuessWordState {
-  // TODO: Combine these two states into a single enum (GuessStatus::Guessing, GuessStatus::Guessed { correct: bool })
-  committed: Observable<bool>,
-  correct: Observable<bool>,
+  status: Observable<GuessStatus>,
   letters: [Observable<LetterState>; 5],
 }
 
 impl GuessWordState {
   const fn new() -> Self {
     Self {
-      committed: Observable::new(false),
-      correct: Observable::new(false),
+      status: Observable::new(GuessStatus::Guessing),
       letters: [const { Observable::new(LetterState::Empty) }; 5],
     }
   }
@@ -661,9 +662,12 @@ impl GuessWordState {
     &self.letters
   }
 
+  fn is_committed(&self) -> bool {
+    matches!(self.status.get(), GuessStatus::Guessed { .. })
+  }
+
   fn reset(&mut self) {
-    self.committed.set_if_changed(false);
-    self.correct.set_if_changed(false);
+    self.status.set_if_changed(GuessStatus::Guessing);
     self.letters.iter_mut().for_each(|letter| {
       if let LetterState::Empty = letter.get() {
         return;
@@ -700,7 +704,7 @@ impl GuessWordState {
   }
 
   fn pop(&mut self) -> bool {
-    if *self.committed.get() {
+    if self.is_committed() {
       return false;
     }
     for state in self.letters.iter_mut().rev() {
@@ -714,7 +718,7 @@ impl GuessWordState {
   }
 
   fn try_commit(&mut self, current_word: Word, word_db: &WordDB) -> Result<(), GuessCommitError> {
-    assert!(!self.committed.get());
+    assert!(!self.is_committed());
     let (guess_word, 5) = self.partial_word() else {
       // Entire word not guessed
       return Err(GuessCommitError::NotEnoughLetters);
@@ -770,8 +774,9 @@ impl GuessWordState {
         status: kind,
       });
     }
-    self.correct.set_if_changed(mismatched == [false; 5]);
-    self.committed.set(true);
+    self.status.set(GuessStatus::Guessed {
+      correct: mismatched == [false; 5],
+    });
     Ok(())
   }
 }
@@ -919,7 +924,6 @@ struct Game {
   current_word: Word,
   guesses: [GuessWordState; 6],
   keyboard: Keyboard,
-  // TODO: Keyboard letter state
 }
 
 impl Game {
@@ -959,7 +963,7 @@ impl Game {
   /// Attempt to push a letter into the latest guess word.
   fn push_letter(&mut self, letter: Letter) -> bool {
     for guess in self.guesses.iter_mut() {
-      if *guess.committed.get() {
+      if guess.is_committed() {
         continue;
       }
       return guess.push(letter);
@@ -980,7 +984,7 @@ impl Game {
   /// Attempt to commit the latest guess word, returning an error if the commit fails.
   fn try_commit_guess(&mut self) -> Result<(), GuessCommitError> {
     for guess in self.guesses.iter_mut() {
-      if *guess.committed.get() {
+      if guess.is_committed() {
         continue;
       }
       guess.try_commit(self.current_word, &self.word_db)?;
