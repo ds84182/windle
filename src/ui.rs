@@ -449,6 +449,7 @@ impl LetterTile {
         };
         self.box_shape.SetStrokeBrush(None)?;
         self.box_fill_brush.StopAnimation(PROP_COLOR)?;
+        self.box_fill_brush.SetColor(UI::Color::default())?;
         self
           .color_animation
           .SetColorParameter(Self::COLOR_ANIM_PARAM, color)?;
