@@ -291,6 +291,8 @@ struct Window {
 }
 
 impl Window {
+  const MIN_SIZE: winit::dpi::PhysicalSize<u32> = winit::dpi::PhysicalSize::new(560, 640);
+
   fn init(
     graphics: &Graphics,
     event_loop: &winit::event_loop::ActiveEventLoop,
@@ -298,7 +300,9 @@ impl Window {
     let winit_window = event_loop.create_window(
       winit::window::WindowAttributes::default()
         .with_no_redirection_bitmap(true)
-        .with_title("Windle"),
+        .with_title("Windle")
+        .with_min_inner_size(Self::MIN_SIZE)
+        .with_inner_size(Self::MIN_SIZE),
     )?;
 
     let interop = graphics.comp.cast::<ICompositorDesktopInterop>()?;
