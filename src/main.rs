@@ -1,7 +1,17 @@
-use std::{collections::BTreeMap, rc::Rc};
+use std::{
+  cell::{Cell, OnceCell},
+  collections::BTreeMap,
+  rc::Rc,
+  sync::Arc,
+};
 
 use windows::{
-  UI::Composition::{CompositionGraphicsDevice, Compositor, Desktop::DesktopWindowTarget},
+  Devices::Input::PointerDeviceType,
+  Foundation::Size,
+  UI::{
+    Composition::{CompositionGraphicsDevice, Compositor, Desktop::DesktopWindowTarget},
+    Input::PointerPoint,
+  },
   Win32::{
     Foundation::{HMODULE, HWND},
     Graphics::{
@@ -27,14 +37,21 @@ use windows::{
       CreateDispatcherQueueController, DQTAT_COM_STA, DQTYPE_THREAD_CURRENT,
       DispatcherQueueOptions,
     },
-    UI::WindowsAndMessaging::{
-      NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-      SystemParametersInfoW,
+    UI::{
+      Input::Pointer::EnableMouseInPointer,
+      WindowsAndMessaging::{
+        MSG, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+        SystemParametersInfoW, WM_POINTERACTIVATE, WM_POINTERCAPTURECHANGED,
+        WM_POINTERDEVICECHANGE, WM_POINTERDEVICEINRANGE, WM_POINTERDEVICEOUTOFRANGE,
+        WM_POINTERDOWN, WM_POINTERENTER, WM_POINTERHWHEEL, WM_POINTERLEAVE, WM_POINTERUP,
+        WM_POINTERUPDATE, WM_POINTERWHEEL,
+      },
     },
   },
   core::{HSTRING, Interface},
 };
-use winit::platform::windows::WindowAttributesExtWindows;
+use windows_numerics::Vector2;
+use winit::platform::windows::{EventLoopBuilderExtWindows, WindowAttributesExtWindows};
 
 use crate::observe::Observable;
 
@@ -42,6 +59,10 @@ mod observe;
 mod ui;
 
 fn main() {
+  unsafe {
+    EnableMouseInPointer(true).expect("Could not enable mouse in pointer mode");
+  }
+
   let _dqc = unsafe {
     CreateDispatcherQueueController(DispatcherQueueOptions {
       dwSize: std::mem::size_of::<DispatcherQueueOptions>() as u32,
@@ -53,8 +74,39 @@ fn main() {
 
   let gfx = Graphics::init().unwrap();
 
-  let event_loop = winit::event_loop::EventLoop::new().unwrap();
+  let pointer_id = Rc::new(Cell::new(0u16));
+  let event_loop = winit::event_loop::EventLoop::<GameAction>::with_user_event()
+    .with_msg_hook({
+      let pointer_id = pointer_id.clone();
+      move |msg| {
+        let msg = msg as *const MSG;
+        let msg = unsafe { &*msg };
+
+        match msg.message {
+          WM_POINTERACTIVATE
+          | WM_POINTERCAPTURECHANGED
+          | WM_POINTERDEVICECHANGE
+          | WM_POINTERDEVICEINRANGE
+          | WM_POINTERDEVICEOUTOFRANGE
+          | WM_POINTERDOWN
+          | WM_POINTERENTER
+          | WM_POINTERLEAVE
+          | WM_POINTERUP
+          | WM_POINTERUPDATE
+          | WM_POINTERWHEEL
+          | WM_POINTERHWHEEL => {
+            pointer_id.set(msg.wParam.0 as u16);
+
+            false
+          }
+          _ => false,
+        }
+      }
+    })
+    .build()
+    .unwrap();
   event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+  let proxy = Arc::new(event_loop.create_proxy());
   event_loop
     .run_app(&mut App {
       window: None,
@@ -65,7 +117,10 @@ fn main() {
         ctrl: false,
         shift: false,
         alt: false,
+        pointer_id,
+        current_target: OnceCell::new(),
       },
+      proxy,
     })
     .unwrap();
 }
@@ -74,6 +129,14 @@ struct InputState {
   ctrl: bool,
   shift: bool,
   alt: bool,
+  pointer_id: Rc<Cell<u16>>,
+  current_target: OnceCell<Rc<dyn ui::HitTarget>>,
+}
+
+impl ui::ActionSender<GameAction> for winit::event_loop::EventLoopProxy<GameAction> {
+  fn send(&self, action: GameAction) -> bool {
+    self.send_event(action).is_ok()
+  }
 }
 
 struct App {
@@ -82,9 +145,10 @@ struct App {
   game_ui: Option<ui::GameUi>,
   game: Game,
   input: InputState,
+  proxy: Arc<winit::event_loop::EventLoopProxy<GameAction>>,
 }
 
-impl winit::application::ApplicationHandler for App {
+impl winit::application::ApplicationHandler<GameAction> for App {
   fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
     let window = self
       .window
@@ -105,6 +169,68 @@ impl winit::application::ApplicationHandler for App {
     event: winit::event::WindowEvent,
   ) {
     match event {
+      winit::event::WindowEvent::Touch(input) => {
+        // Because we enabled mouse in pointer mode, mouse events come in as touch events.
+        // We can then use the Pointer ID from the window message with PointerPoint.
+        // This allows us to use GestureRecognizer.
+
+        let event = match input.phase {
+          winit::event::TouchPhase::Started => ui::PointerEventKind::Down,
+          winit::event::TouchPhase::Ended => ui::PointerEventKind::Up,
+          winit::event::TouchPhase::Cancelled => ui::PointerEventKind::Up,
+          winit::event::TouchPhase::Moved => ui::PointerEventKind::Move,
+        };
+
+        let pointer_point =
+          PointerPoint::GetCurrentPoint(self.input.pointer_id.get() as u32).unwrap();
+        let point = pointer_point.Position().unwrap();
+
+        let device = pointer_point.PointerDevice().unwrap();
+        let mouse = device.PointerDeviceType().unwrap() == PointerDeviceType::Mouse;
+
+        let Some(ui) = &self.game_ui else { return };
+
+        let window = self.window.as_ref().unwrap().winit_window.as_ref().unwrap();
+        let logical_window_size = window.inner_size().to_logical(window.scale_factor());
+
+        let target = self.input.current_target.get().cloned().or_else(|| {
+          ui.hit_test(ui::HitTest::new(
+            Size {
+              Width: logical_window_size.width,
+              Height: logical_window_size.height,
+            },
+            Vector2 {
+              X: if mouse { point.X.round() } else { point.X },
+              Y: if mouse { point.Y.round() } else { point.Y },
+            },
+          ))
+          .unwrap()
+        });
+
+        let Some(target) = target else {
+          window.set_cursor(winit::window::CursorIcon::Default);
+
+          return;
+        };
+
+        window.set_cursor(match target.cursor() {
+          ui::Cursor::LinkSelect => winit::window::CursorIcon::Pointer,
+        });
+
+        let grab_focus = target
+          .on_pointer_event(
+            &(self.proxy.clone() as Arc<dyn ui::ActionSender<GameAction>>),
+            event,
+            &pointer_point,
+          )
+          .expect("Failed to send pointer event to target");
+
+        if grab_focus {
+          let _ = self.input.current_target.set(target);
+        } else {
+          let _ = self.input.current_target.take();
+        }
+      }
       winit::event::WindowEvent::KeyboardInput {
         event,
         is_synthetic: false,
@@ -160,6 +286,20 @@ impl winit::application::ApplicationHandler for App {
       }
       _ => {}
     }
+  }
+
+  fn user_event(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop, event: GameAction) {
+      match event {
+        GameAction::PopLetter => {
+          self.game.pop_letter();
+        },
+        GameAction::PushLetter(letter) => {
+          self.game.push_letter(letter);
+        }
+        GameAction::TryCommitGuess => {
+          let _ = self.game.try_commit_guess();
+        }
+      }
   }
 }
 
@@ -917,6 +1057,13 @@ impl Keyboard {
     *status = None;
     true
   }
+}
+
+#[derive(Clone, Debug)]
+enum GameAction {
+  PushLetter(Letter),
+  PopLetter,
+  TryCommitGuess,
 }
 
 struct Game {

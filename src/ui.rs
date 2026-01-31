@@ -1,12 +1,15 @@
 use std::{
   cell::{OnceCell, RefCell},
   f32,
+  marker::PhantomData,
   rc::Rc,
+  sync::Arc,
   time::Duration,
 };
 
+use ref_cast::RefCast;
 use windows::{
-  Foundation::{Size, TimeSpan},
+  Foundation::{Size, TimeSpan, TypedEventHandler},
   Graphics::{
     DirectX::{DirectXAlphaMode, DirectXPixelFormat},
     SizeInt32,
@@ -16,8 +19,9 @@ use windows::{
     Composition::{
       ColorKeyFrameAnimation, CompositionColorBrush, CompositionDrawingSurface,
       CompositionSpriteShape, CompositionSurfaceBrush, ContainerVisual, ScalarKeyFrameAnimation,
-      ShapeVisual, SpriteVisual,
+      ShapeVisual, SpriteVisual, Visual,
     },
+    Input::{GestureRecognizer, GestureSettings, PointerPoint},
   },
   Win32::{
     Graphics::{
@@ -38,7 +42,7 @@ use windows::{
 use windows_numerics::{Vector2, Vector3};
 
 use crate::{
-  Game, Graphics, GuessWordState, Letter, LetterMap, LetterState, LetterStatus,
+  Game, GameAction, Graphics, GuessWordState, Letter, LetterMap, LetterState, LetterStatus,
   observe::{Observable, Observer},
 };
 
@@ -48,6 +52,20 @@ const PROP_COLOR: &HSTRING = windows::core::h!("Color");
 const fn time_span(duration: Duration) -> TimeSpan {
   TimeSpan {
     Duration: duration.as_nanos() as i64 / 100,
+  }
+}
+
+trait IntoVector2 {
+  fn xy(self) -> Vector2;
+}
+
+impl IntoVector2 for Vector3 {
+  #[inline]
+  fn xy(self) -> Vector2 {
+    Vector2 {
+      X: self.X,
+      Y: self.Y,
+    }
   }
 }
 
@@ -63,6 +81,123 @@ impl UiContext {
       gfx: gfx.clone(),
     }
   }
+}
+
+#[derive(ref_cast::RefCast)]
+#[repr(transparent)]
+struct SubClass<M, T>(T, PhantomData<M>);
+
+trait SubClassOf<T>: windows::core::Interface + windows::core::imp::CanInto<T> {}
+
+impl<T, V: windows::core::Interface + windows::core::imp::CanInto<T>> SubClassOf<T> for V {}
+
+type ReturnType<T = ()> = T;
+
+macro_rules! subclass_proxy {
+  (
+    $class:ty: {
+      $(fn $fn_name:ident$([$($generics:tt)*])?($($arg:ident: $arg_ty:ty),* $(,)?) $(-> $ret:ty)?);*
+      $(;)?
+    }
+  ) => {
+    impl<T: SubClassOf<$class>> SubClass<$class, T> {
+      $(
+        #[allow(non_snake_case)]
+        fn $fn_name<$($generics)*>(&self, $($arg: $arg_ty,)*) -> windows::core::Result<ReturnType<$($ret)?>> {
+          self.0.cast::<$class>()?.$fn_name($($arg)*)
+        }
+      )*
+    }
+  };
+}
+
+subclass_proxy! {
+  Visual: {
+    fn Offset() -> Vector3;
+    fn RelativeOffsetAdjustment() -> Vector3;
+
+    fn Size() -> Vector2;
+    fn RelativeSizeAdjustment() -> Vector2;
+
+    fn AnchorPoint() -> Vector2;
+  }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct HitTest {
+  size: Size,
+  point: Vector2,
+}
+
+impl HitTest {
+  pub(crate) fn new(size: Size, point: Vector2) -> Self {
+    Self { size, point }
+  }
+
+  fn for_visual(
+    &self,
+    visual: &SubClass<Visual, impl SubClassOf<Visual>>,
+  ) -> windows::core::Result<HitTest> {
+    let size = visual.Size()?;
+    let relative_size = visual.RelativeSizeAdjustment()?;
+    let size = Size {
+      Width: size.X + self.size.Width * relative_size.X,
+      Height: size.Y + self.size.Height * relative_size.Y,
+    };
+
+    // TODO: Handle rotation, scale, center point, and arbitrary transforms?
+
+    let anchor_point = visual.AnchorPoint()?
+      * Vector2 {
+        X: size.Width,
+        Y: size.Height,
+      };
+
+    let offset = (visual.Offset()?.xy()
+      + visual.RelativeOffsetAdjustment()?.xy()
+        * Vector2 {
+          X: self.size.Width,
+          Y: self.size.Height,
+        })
+      - anchor_point;
+    let point = self.point - offset;
+
+    Ok(HitTest { size, point })
+  }
+
+  fn in_bounds(&self) -> bool {
+    !(self.point.X < 0.0
+      || self.point.Y < 0.0
+      || self.point.X > self.size.Width
+      || self.point.Y > self.size.Height)
+  }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Cursor {
+  LinkSelect,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PointerEventKind {
+  Down,
+  Up,
+  Move,
+}
+
+pub(crate) trait HitTarget {
+  fn cursor(&self) -> Cursor;
+
+  fn on_pointer_event(
+    &self,
+    action: &Arc<dyn ActionSender<GameAction>>,
+    kind: PointerEventKind,
+    pointer: &PointerPoint,
+  ) -> windows::core::Result<bool>;
+}
+
+pub(crate) trait ActionSender<T>: Send + Sync {
+  fn send(&self, action: T) -> bool;
 }
 
 pub(crate) struct GameUi {
@@ -104,6 +239,36 @@ impl GameUi {
   pub(crate) fn root(&self) -> &ContainerVisual {
     &self.root
   }
+
+  pub(crate) fn hit_test(
+    &self,
+    hit_test: HitTest,
+  ) -> windows::core::Result<Option<Rc<dyn HitTarget>>> {
+    let hit_test = hit_test.for_visual(SubClass::ref_cast(&self.keyboard.visual))?;
+
+    if !hit_test.in_bounds() {
+      // Keyboard was not hit
+      return Ok(None);
+    }
+
+    for row in &self.keyboard.rows {
+      let hit_test = hit_test.for_visual(SubClass::ref_cast(&row.visual))?;
+
+      if !hit_test.in_bounds() {
+        continue;
+      }
+
+      for key in &row.keys {
+        let hit_test = hit_test.for_visual(SubClass::ref_cast(&key.visual))?;
+
+        if hit_test.in_bounds() {
+          return Ok(Some(key.clone()));
+        }
+      }
+    }
+
+    Ok(None)
+  }
 }
 
 struct Theme {
@@ -144,7 +309,7 @@ const DARK: &Theme = &Theme {
   key_bg_absent: color(0xFF3A3A3C),
 };
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Text {
   Char(char),
   String(HSTRING),
@@ -643,6 +808,9 @@ struct Key {
   char_surface: RefCell<TextSurface>,
 
   observer: OnceCell<Observer<Option<LetterStatus>>>,
+
+  gesture_recognizer: RefCell<Option<GestureRecognizer>>,
+  game_action: GameAction,
 }
 
 impl Key {
@@ -657,6 +825,7 @@ impl Key {
     text: Text,
     wide: bool,
     small_font: bool,
+    game_action: GameAction,
     cx: &Rc<UiContext>,
     state: Option<&Observable<Option<LetterStatus>>>,
   ) -> windows::core::Result<Rc<Self>> {
@@ -723,6 +892,8 @@ impl Key {
       box_fill_brush,
       char_surface: RefCell::new(char_surface),
       observer: OnceCell::new(),
+      gesture_recognizer: RefCell::default(),
+      game_action,
     });
 
     if let Some(state) = state {
@@ -768,6 +939,45 @@ impl Key {
       }
     }
     Ok(())
+  }
+}
+
+impl HitTarget for Key {
+  fn cursor(&self) -> Cursor {
+    Cursor::LinkSelect
+  }
+
+  fn on_pointer_event(
+    &self,
+    action: &Arc<dyn ActionSender<GameAction>>,
+    kind: PointerEventKind,
+    pointer: &PointerPoint,
+  ) -> windows::core::Result<bool> {
+    let mut gesture_mut = self.gesture_recognizer.borrow_mut();
+    let gesture = if let Some(gesture) = &*gesture_mut {
+      gesture.clone()
+    } else {
+      let new_gesture = GestureRecognizer::new()?;
+      new_gesture.SetGestureSettings(GestureSettings::Tap)?;
+      let action = action.clone();
+      let game_action = self.game_action.clone();
+      new_gesture.Tapped(&TypedEventHandler::new(move |_, _| {
+        action.send(game_action.clone());
+        Ok(())
+      }))?;
+      gesture_mut.insert(new_gesture).clone()
+    };
+    drop(gesture_mut);
+
+    match kind {
+      PointerEventKind::Down => gesture.ProcessDownEvent(pointer)?,
+      PointerEventKind::Up => gesture.ProcessUpEvent(pointer)?,
+      PointerEventKind::Move => {
+        gesture.ProcessMoveEvents(&PointerPoint::GetIntermediatePoints(pointer.PointerId()?)?)?
+      }
+    }
+
+    Ok(gesture.IsActive()?)
   }
 }
 
@@ -856,6 +1066,7 @@ impl Keyboard {
           Text::Char(letter.into()),
           false,
           false,
+          GameAction::PushLetter(letter),
           cx,
           Some(&state[letter]),
         )
@@ -870,6 +1081,7 @@ impl Keyboard {
           Text::Char(letter.into()),
           false,
           false,
+          GameAction::PushLetter(letter),
           cx,
           Some(&state[letter]),
         )
@@ -883,6 +1095,7 @@ impl Keyboard {
           Text::String(windows::core::h!("ENTER").clone()),
           true,
           true,
+          GameAction::TryCommitGuess,
           cx,
           None,
         )
@@ -893,6 +1106,7 @@ impl Keyboard {
           Text::Char(letter.into()),
           false,
           false,
+          GameAction::PushLetter(letter),
           cx,
           Some(&state[letter]),
         )
@@ -903,6 +1117,7 @@ impl Keyboard {
           Text::String(windows::core::h!("⌫").clone()),
           true,
           false,
+          GameAction::PopLetter,
           cx,
           None,
         )
